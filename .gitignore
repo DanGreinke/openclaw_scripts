@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# OpenClaw runtime data (generated, not tracked)
+brief_data.txt
