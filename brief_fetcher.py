@@ -2,14 +2,16 @@
 """
 brief_fetcher.py
 Fetches morning data and saves to file. Fast, model-free.
-Overwrites /data/workspace/brief_data.txt each run.
+Writes to brief_data.txt in the repo directory (ignored by git).
 """
 
 import json, os, urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
-# Config
-DATA_FILE = "/data/workspace/brief_data.txt"
+# Config — write to repo directory
+SCRIPT_DIR = Path(__file__).parent
+DATA_FILE = SCRIPT_DIR / "brief_data.txt"
 AV_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
 BRAVE_KEY = os.environ.get("BRAVE_SEARCH_API_KEY", "")
 PURPLE_KEY = os.environ.get("PURPLE_AIR_API_KEY_READ", "")
