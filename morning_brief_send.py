@@ -59,13 +59,15 @@ def fetch_weather():
 # Sunnyvale ZIP: 94086
 EPA_UV_API_URL = "https://enviro.epa.gov/enviro/efservice/getEnvirofactsUVHOURLY/ZIP/94086/JSON"
 
-def fetch_uv_index_epa():
+def fetch_uv_peaks():
     """
-    Fetch current UV index from EPA Envirofacts API.
-    Uses Sunnyvale ZIP code 94086.
-    
+    Fetch peak UV value and time for today and tomorrow from EPA Envirofacts hourly data.
+
     Returns:
-        int: UV index value (0-11+) or None if unavailable/error
+        dict with 'today' and/or 'tomorrow' keys, each containing:
+            'peak'      - int UV index
+            'peak_time' - str like "1 PM"
+        Returns None on error or missing data.
     """
     try:
         req = urllib.request.Request(
@@ -74,29 +76,34 @@ def fetch_uv_index_epa():
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
-            
-        # EPA returns a list of records with UV data
-        # Each record has: UV_VALUE, DATE_TIME, etc.
-        if not data or not isinstance(data, list) or len(data) == 0:
+
+        if not data or not isinstance(data, list):
             return None
-            
-        # Get the most recent UV reading (first in list is usually current hour)
-        # Data comes sorted by time, newest first
+
+        # Group hourly readings by date
+        # EPA DATE_TIME format: "Mar/25/2026 07 AM"
+        daily = {}
         for record in data:
+            date_time_str = record.get("DATE_TIME", "")
             uv_value = record.get("UV_VALUE")
-            if uv_value is not None:
-                try:
-                    return int(float(uv_value))
-                except (ValueError, TypeError):
-                    continue
-                    
-        return None
-    except urllib.error.URLError as e:
-        print(f"EPA UV API network error: {e}", file=sys.stderr)
-        return None
-    except json.JSONDecodeError as e:
-        print(f"EPA UV API JSON parse error: {e}", file=sys.stderr)
-        return None
+            if not date_time_str or uv_value is None:
+                continue
+            try:
+                dt = datetime.strptime(date_time_str.strip(), "%b/%d/%Y %I %p")
+                daily.setdefault(dt.date(), []).append((dt, int(float(uv_value))))
+            except (ValueError, TypeError):
+                continue
+
+        result = {}
+        today_date = datetime.now().date()
+        for i, label in enumerate(["today", "tomorrow"]):
+            target = today_date + timedelta(days=i)
+            if target in daily:
+                peak_dt, peak_uv = max(daily[target], key=lambda x: x[1])
+                result[label] = {"peak": peak_uv, "peak_time": peak_dt.strftime("%-I %p")}
+
+        return result if result else None
+
     except Exception as e:
         print(f"EPA UV API error: {e}", file=sys.stderr)
         return None
@@ -192,12 +199,18 @@ def main():
             
         lines.append(weather_line)
         
-        # UV Index from EPA API
-        uv_index = fetch_uv_index_epa()
-        if uv_index is not None:
-            uv_cat = get_uv_category(uv_index)
+        # UV Index from EPA API — peak value and time for today and tomorrow
+        uv_peaks = fetch_uv_peaks()
+        if uv_peaks and "today" in uv_peaks:
+            td = uv_peaks["today"]
+            uv_cat = get_uv_category(td["peak"])
             uv_emoji = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴", "Extreme": "⚫"}.get(uv_cat, "")
-            lines.append(f"☀️ UV Index: {uv_index} ({uv_cat}) {uv_emoji}")
+            uv_line = f"☀️ UV Index: peak {td['peak']} ({uv_cat}) at {td['peak_time']} {uv_emoji}"
+            if "tomorrow" in uv_peaks:
+                tm = uv_peaks["tomorrow"]
+                tm_cat = get_uv_category(tm["peak"])
+                uv_line += f"  |  Tomorrow: {tm['peak']} ({tm_cat}) at {tm['peak_time']}"
+            lines.append(uv_line)
     except Exception as e:
         lines.append(f"🌤 Weather: unavailable")
 
