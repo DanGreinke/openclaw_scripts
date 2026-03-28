@@ -98,6 +98,23 @@ def fetch_weather():
     return data["properties"]["periods"][:6]
 
 
+def fetch_uv():
+    """Fetch today's hourly UV index from Open-Meteo and return peak value and time."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=37.3688&longitude=-122.0363"
+        "&hourly=uv_index&timezone=America%2FLos_Angeles&forecast_days=1"
+    )
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read())
+    times = data["hourly"]["time"]
+    uv_values = data["hourly"]["uv_index"]
+    peak_uv = max(uv_values)
+    peak_time_str = times[uv_values.index(peak_uv)]
+    peak_hour = datetime.fromisoformat(peak_time_str).strftime("%-I:%M %p")
+    return {"peak_uv": peak_uv, "peak_time": peak_hour}
+
+
 def main():
     lines = []
     # Use Pacific time (UTC-7 PDT / UTC-8 PST); detect DST simply by month
@@ -173,6 +190,16 @@ def main():
             )
     except Exception as e:
         lines.append(f"ERROR fetching weather: {e}")
+
+    lines.append("")
+
+    # UV Index
+    lines.append("=== UV INDEX — Sunnyvale, CA ===")
+    try:
+        uv = fetch_uv()
+        lines.append(f"Peak UV Index: {uv['peak_uv']} at {uv['peak_time']}")
+    except Exception as e:
+        lines.append(f"ERROR fetching UV index: {e}")
 
     lines.append("")
 

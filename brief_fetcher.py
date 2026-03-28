@@ -44,6 +44,22 @@ def fetch_weather():
         periods = json.loads(r.read())["properties"]["periods"][:4]
     return [(p["name"], p["temperature"], p["shortForecast"]) for p in periods]
 
+def fetch_uv():
+    """Fetch today's hourly UV index from Open-Meteo and return peak value and time."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=37.3688&longitude=-122.0363"
+        "&hourly=uv_index&timezone=America%2FLos_Angeles&forecast_days=1"
+    )
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read())
+    times = data["hourly"]["time"]
+    uv_values = data["hourly"]["uv_index"]
+    peak_uv = max(uv_values)
+    peak_time_str = times[uv_values.index(peak_uv)]
+    peak_hour = datetime.fromisoformat(peak_time_str).strftime("%-I:%M %p")
+    return {"peak_uv": peak_uv, "peak_time": peak_hour}
+
 def fetch_aqi():
     req = urllib.request.Request(
         "https://api.purpleair.com/v1/sensors/13987?fields=pm2.5",
@@ -94,6 +110,15 @@ def main():
             lines.append(f"AQI: {aqi['aqi']} ({aqi['category']})")
     except Exception as e:
         lines.append(f"AQI error: {e}")
+    lines.append("")
+
+    # UV Index
+    try:
+        uv = fetch_uv()
+        lines.append("=== UV INDEX ===")
+        lines.append(f"Peak UV Index: {uv['peak_uv']} at {uv['peak_time']}")
+    except Exception as e:
+        lines.append(f"UV error: {e}")
     lines.append("")
     
     if is_weekday:
