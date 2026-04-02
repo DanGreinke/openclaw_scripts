@@ -79,7 +79,7 @@ def main():
     message = (
         f"{emoji} Air Quality Alert — Sunnyvale\n"
         f"AQI: {aqi} ({cat})\n"
-        f"PM2.5: {pm} µg/m³\n"
+        f"PM2.5: {pm} µg/m\u00b3\n"
         f"Consider limiting outdoor activity."
     )
     send_telegram(message)
