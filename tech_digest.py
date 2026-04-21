@@ -123,21 +123,26 @@ def fetch_top_rss_item():
 
 
 def fetch_hn(count=3):
-    """Fetch top HN stories matching tech topics by score."""
-    query = urllib.parse.quote("AI agent LLM autonomous self-driving")
+    """Fetch top HN stories by comment count from last 48 hours."""
+    # Unix timestamp for 48 hours ago
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    cutoff_ts = now_ts - (48 * 3600)
+    
     url = (
         "https://hn.algolia.com/api/v1/search"
-        f"?query={query}&tags=story&hitsPerPage=20&numericFilters=points>20"
+        f"?query=&tags=story&hitsPerPage=100&numericFilters=created_at_i>{cutoff_ts}"
     )
     with urllib.request.urlopen(url, timeout=10) as r:
         hits = json.loads(r.read()).get("hits", [])
-    seen = set()
+    
+    # Sort by comment count descending, take top N
+    sorted_hits = sorted(hits, key=lambda x: x.get("num_comments", 0), reverse=True)
+    
     results = []
-    for h in sorted(hits, key=lambda x: x.get("points", 0), reverse=True):
+    for h in sorted_hits[:count]:
         title = h.get("title", "")
-        if not title or title in seen:
+        if not title:
             continue
-        seen.add(title)
         hn_url  = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
         hn_link = f"https://news.ycombinator.com/item?id={h.get('objectID')}"
         results.append({
@@ -147,8 +152,6 @@ def fetch_hn(count=3):
             "points":   h.get("points", 0),
             "comments": h.get("num_comments", 0),
         })
-        if len(results) >= count:
-            break
     return results
 
 
