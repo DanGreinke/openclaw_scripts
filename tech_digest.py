@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 """
-tech_digest.py
-Daily tech digest: agentic AI, autonomous vehicles, emerging tech.
-Sources: Brave News API, RSS feeds, Hacker News (Algolia), ArXiv.
-Sends 3 Telegram messages: News | Community | Research.
+tech_digest.py — fetcher stage.
+
+Fetches curated RSS, Hacker News, and ArXiv items and writes the raw
+data to a JSON file. The summarization stage (tech_digest_summarize.py)
+reads this file, asks the LLM to write a tight brief, and sends to Telegram.
+
+For fresh news, the Hermes-side web_search tool is used during summarization
+or interactive use; we don't depend on a Brave News API key here.
+
+Outputs:
+  /data/.hermes/scripts/tech_digest_data_<YYYY-MM-DD>.json
+
+Exit codes:
+  0 = success (file written)
+  1 = partial success (some sections failed but file still written)
+  2 = fatal (couldn't write output file)
 """
 
-import json, os, re, subprocess, sys, urllib.request, urllib.parse
+import json
+import os
+import re
+import sys
+import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
-BRAVE_KEY       = os.environ.get("BRAVE_SEARCH_API_KEY", "")
-TELEGRAM_TARGET = "8438066154"
+# Hermes has built-in web_search; we don't need a Brave News API key here.
+BRAVE_KEY = ""
+OUTPUT_DIR      = Path("/data/.hermes/scripts")
 
 # --- RSS feeds (filtered by keyword) ---
 RSS_FEEDS = [
@@ -25,13 +44,6 @@ RSS_KEYWORDS = [
     "ai", "artificial intelligence", "machine learning", "llm", "language model",
     "agent", "autonomous", "self-driving", "robot", "neural", "quantum",
     "semiconductor", "biotech", "drone",
-]
-
-# --- Brave News: one query per topic ---
-BRAVE_TOPICS = [
-    ("🤖 Agentic AI",          "agentic AI LLM agent news"),
-    ("🚗 Autonomous Vehicles",  "autonomous vehicle self-driving news"),
-    ("⚡ Emerging Tech",        "emerging technology breakthrough 2026"),
 ]
 
 
@@ -48,37 +60,11 @@ def truncate(text, n=140):
     return text[:n] + "…" if len(text) > n else text
 
 
-def fetch_brave(query):
-    """Return top result for query as {title, description, url}."""
-    if not BRAVE_KEY:
-        return None
-    url = (
-        "https://api.search.brave.com/res/v1/news/search"
-        f"?q={urllib.parse.quote(query)}&count=1&freshness=pd"
-    )
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "X-Subscription-Token": BRAVE_KEY,
-    })
-    with urllib.request.urlopen(req, timeout=10) as r:
-        results = json.loads(r.read()).get("results", [])
-    if not results:
-        return None
-    item = results[0]
-    return {
-        "title": item.get("title", ""),
-        "summary": truncate(item.get("description", "")),
-        "url": item.get("url", ""),
-    }
-
-
 def fetch_rss_items(url, source_name):
-    """Fetch and parse an RSS 2.0 feed, return list of items."""
-    req = urllib.request.Request(url, headers={"User-Agent": "OpenClaw/1.0 tech-digest"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0 tech-digest"})
     with urllib.request.urlopen(req, timeout=10) as r:
         root = ET.fromstring(r.read())
     items = []
-    # Handle both RSS 2.0 and Atom
     channel = root.find("channel")
     entries = channel.findall("item") if channel is not None else root.findall(
         "{http://www.w3.org/2005/Atom}entry"
@@ -94,7 +80,6 @@ def fetch_rss_items(url, source_name):
         link  = get("link",  "{http://www.w3.org/2005/Atom}link")
         desc  = strip_html(get("description", "{http://www.w3.org/2005/Atom}summary"))
 
-        # Atom <link> is an attribute, not text
         if not link:
             el = entry.find("{http://www.w3.org/2005/Atom}link")
             if el is not None:
@@ -104,13 +89,19 @@ def fetch_rss_items(url, source_name):
     return items
 
 
+# Word-boundary matching: plain substring lets "ai" hit "said"/"available".
+_RSS_KW_RES = [
+    re.compile(r"\b" + re.escape(kw) + (r"\b" if len(kw) <= 3 else ""))
+    for kw in RSS_KEYWORDS
+]
+
+
 def rss_matches_keywords(item):
     text = (item["title"] + " " + item["summary"]).lower()
-    return any(kw in text for kw in RSS_KEYWORDS)
+    return any(rx.search(text) for rx in _RSS_KW_RES)
 
 
 def fetch_top_rss_item():
-    """Return the single most relevant recent item across all RSS feeds."""
     for name, url in RSS_FEEDS:
         try:
             items = fetch_rss_items(url, name)
@@ -123,21 +114,17 @@ def fetch_top_rss_item():
 
 
 def fetch_hn(count=3):
-    """Fetch top HN stories by comment count from last 48 hours."""
-    # Unix timestamp for 48 hours ago
     now_ts = int(datetime.now(timezone.utc).timestamp())
     cutoff_ts = now_ts - (48 * 3600)
-    
+
     url = (
         "https://hn.algolia.com/api/v1/search"
         f"?query=&tags=story&hitsPerPage=100&numericFilters=created_at_i>{cutoff_ts}"
     )
-    with urllib.request.urlopen(url, timeout=10) as r:
+    with urllib.request.urlopen(req_orig(url), timeout=10) as r:
         hits = json.loads(r.read()).get("hits", [])
-    
-    # Sort by comment count descending, take top N
+
     sorted_hits = sorted(hits, key=lambda x: x.get("num_comments", 0), reverse=True)
-    
     results = []
     for h in sorted_hits[:count]:
         title = h.get("title", "")
@@ -155,8 +142,15 @@ def fetch_hn(count=3):
     return results
 
 
+def req_orig(url, headers=None):
+    """Build a urllib.request.Request with default UA headers."""
+    h = {"User-Agent": "Hermes/1.0 tech-digest"}
+    if headers:
+        h.update(headers)
+    return urllib.request.Request(url, headers=h)
+
+
 def fetch_arxiv(count=3):
-    """Fetch recent papers from cs.AI, cs.LG, cs.RO."""
     query = urllib.parse.quote("cat:cs.AI OR cat:cs.LG OR cat:cs.RO")
     url = (
         "http://export.arxiv.org/api/query"
@@ -164,7 +158,7 @@ def fetch_arxiv(count=3):
         "&sortBy=submittedDate&sortOrder=descending"
         f"&max_results={count}"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "OpenClaw/1.0 tech-digest"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0 tech-digest"})
     with urllib.request.urlopen(req, timeout=15) as r:
         root = ET.fromstring(r.read())
     ns = {"a": "http://www.w3.org/2005/Atom"}
@@ -185,98 +179,61 @@ def fetch_arxiv(count=3):
 
 
 # ---------------------------------------------------------------------------
-# Formatting & sending
+# Main
 # ---------------------------------------------------------------------------
-
-def send_telegram(message):
-    result = subprocess.run(
-        ["openclaw", "message", "send",
-         "--channel", "telegram",
-         "--target", TELEGRAM_TARGET,
-         "--message", message],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"Send failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
 
 def main():
     utc = datetime.now(timezone.utc)
     dst = (utc.month > 3 or (utc.month == 3 and utc.day >= 8)) and utc.month < 11
     now = utc.astimezone(timezone(timedelta(hours=-7 if dst else -8)))
     date_str = now.strftime("%B %-d, %Y")
+    iso_date = now.strftime("%Y-%m-%d")
 
-    # ------------------------------------------------------------------
-    # Message 1: News (Brave per topic + one RSS item)
-    # ------------------------------------------------------------------
-    news_lines = [f"📰 Tech News — {date_str}\n"]
+    data = {
+        "date": date_str,
+        "fetched_at_utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "news": [],       # reserved; Hermes-side web_search handles fresh news
+        "rss_top": None,
+        "hn": [],         # list of {"title", "url", "hn_link", "points", "comments"}
+        "arxiv": [],      # list of {"title", "summary", "url"}
+        "errors": [],
+    }
 
-    if not BRAVE_KEY:
-        news_lines.append("(Brave API key not set)")
-    else:
-        for label, query in BRAVE_TOPICS:
-            try:
-                item = fetch_brave(query)
-                if item:
-                    news_lines.append(f"{label}")
-                    news_lines.append(f"• {item['title']}")
-                    if item["summary"]:
-                        news_lines.append(f"  {item['summary']}")
-                    news_lines.append(f"  🔗 {item['url']}")
-                    news_lines.append("")
-            except Exception as e:
-                news_lines.append(f"{label}: error — {e}\n")
+    # (Brave News removed — Hermes itself uses web_search for fresh news.)
 
+    # RSS top pick
     try:
-        rss_item = fetch_top_rss_item()
-        if rss_item:
-            news_lines.append(f"📡 {rss_item['source']}")
-            news_lines.append(f"• {rss_item['title']}")
-            if rss_item["summary"]:
-                news_lines.append(f"  {rss_item['summary']}")
-            news_lines.append(f"  🔗 {rss_item['url']}")
+        rss = fetch_top_rss_item()
+        if rss:
+            data["rss_top"] = rss
     except Exception as e:
-        news_lines.append(f"RSS: error — {e}")
+        data["errors"].append(f"RSS: {e}")
 
-    send_telegram("\n".join(news_lines))
-    print("✅ News sent.")
-
-    # ------------------------------------------------------------------
-    # Message 2: Hacker News
-    # ------------------------------------------------------------------
-    hn_lines = ["💬 Hacker News\n"]
+    # Hacker News
     try:
-        stories = fetch_hn(3)
-        for s in stories:
-            hn_lines.append(f"• {s['title']}")
-            hn_lines.append(f"  ↑ {s['points']} · {s['comments']} comments")
-            hn_lines.append(f"  🔗 {s['url']}")
-            hn_lines.append(f"  💬 {s['hn_link']}")
-            hn_lines.append("")
+        data["hn"] = fetch_hn(3)
     except Exception as e:
-        hn_lines.append(f"Error: {e}")
+        data["errors"].append(f"HN: {e}")
 
-    send_telegram("\n".join(hn_lines))
-    print("✅ HN sent.")
-
-    # ------------------------------------------------------------------
-    # Message 3: ArXiv research
-    # ------------------------------------------------------------------
-    arxiv_lines = ["🔬 Research\n"]
+    # ArXiv
     try:
-        papers = fetch_arxiv(3)
-        for p in papers:
-            arxiv_lines.append(f"• {p['title']}")
-            if p["summary"]:
-                arxiv_lines.append(f"  {p['summary']}")
-            arxiv_lines.append(f"  🔗 {p['url']}")
-            arxiv_lines.append("")
+        data["arxiv"] = fetch_arxiv(3)
     except Exception as e:
-        arxiv_lines.append(f"Error: {e}")
+        data["errors"].append(f"ArXiv: {e}")
 
-    send_telegram("\n".join(arxiv_lines))
-    print("✅ Research sent.")
+    # Write output
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUT_DIR / f"tech_digest_data_{iso_date}.json"
+    try:
+        with open(out_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"✅ Wrote {out_path}")
+        print(f"   news={len(data['news'])} rss={data['rss_top'] is not None} hn={len(data['hn'])} arxiv={len(data['arxiv'])} errors={len(data['errors'])}")
+    except Exception as e:
+        print(f"FATAL: could not write {out_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    sys.exit(0 if not data["errors"] else 1)
 
 
 if __name__ == "__main__":
