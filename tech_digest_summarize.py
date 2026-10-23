@@ -2,20 +2,24 @@
 """
 tech_digest_summarize.py — summarize + send.
 
-Reads /data/.hermes/scripts/tech_digest_data_<DATE>.json (written by
-tech_digest.py), calls the configured LLM to write a tight brief following
-the morning_brief_send.py style, and sends the result to Telegram via the
-Bot API.
+Reads today's tech_digest_data_<DATE>.json (written by tech_digest.py) and,
+if present, today's trending_data_<DATE>.json (written by trending.py) from
+$TECH_DIGEST_DIR (default /data/.hermes/scripts), calls the configured LLM
+to write a tight brief following the morning_brief_send.py style, and sends
+the result to Telegram via the Bot API.
 
 Outputs:
-  - /data/.hermes/scripts/tech_digest_digest_<DATE>.txt  (saved copy)
-  - Telegram message
+  - $TECH_DIGEST_DIR/tech_digest_digest_<DATE>.txt  (saved copy)
+  - Telegram message (split into several if over Telegram's length limit)
+
+Files from an earlier day are never used: re-sending yesterday's digest as
+today's is worse than sending nothing.
 
 Exit codes:
   0 = success
-  1 = fetch file missing
+  1 = today's fetch file missing
   2 = LLM call failed
-  3 = Telegram send failed
+  3 = Telegram send failed (or bot token missing)
 """
 
 import json
@@ -27,11 +31,13 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from tech_digest import local_now
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-OUTPUT_DIR = Path("/data/.hermes/scripts")
+OUTPUT_DIR = Path(os.environ.get("TECH_DIGEST_DIR", "/data/.hermes/scripts"))
 TELEGRAM_TARGET = "8438066154"
 TELEGRAM_BOT_TOKEN = ""
 OPENCODE_API_KEY = ""
@@ -50,8 +56,6 @@ def _load_secret(env_path, key):
                 line = line.strip()
                 if line.startswith(f"{key}="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
-                if line.startswith("#"):
-                    continue
     except Exception:
         pass
     return ""
@@ -75,16 +79,33 @@ _load_secrets()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _find_data_file():
-    """Find the most recent tech_digest_data_*.json file."""
-    candidates = sorted(OUTPUT_DIR.glob("tech_digest_data_*.json"), reverse=True)
-    return candidates[0] if candidates else None
+def _today_file(prefix):
+    """Today's <prefix>_<DATE>.json, or None. Older files are ignored."""
+    today = local_now(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    path = OUTPUT_DIR / f"{prefix}_{today}.json"
+    return path if path.exists() else None
 
 
-def _find_trending_file():
-    """Find the most recent trending_data_*.json file (may be None)."""
-    candidates = sorted(OUTPUT_DIR.glob("trending_data_*.json"), reverse=True)
-    return candidates[0] if candidates else None
+TRENDING_SHOWN = 3  # how many trending candidates the prompt asks for
+
+
+def _drop_overlap(data, trending):
+    """Remove HN stories / the RSS pick that will already appear in the
+    Trending section, so the digest doesn't show the same item twice."""
+    if not trending:
+        return data
+    shown = set()
+    for c in (trending.get("candidates") or [])[:TRENDING_SHOWN]:
+        for u in (c.get("url"), c.get("hn_link")):
+            if u:
+                shown.add(u)
+    data = dict(data)
+    data["hn"] = [s for s in data.get("hn") or []
+                  if s.get("url") not in shown and s.get("hn_link") not in shown][:3]
+    rss = data.get("rss_top")
+    if rss and rss.get("url") in shown:
+        data["rss_top"] = None
+    return data
 
 
 def _out_path_for(data_path):
@@ -114,9 +135,10 @@ If rising is true, prefix the title with 🔥. Then a 🔗 link line.
 formatted like "2.3k★ this week", and a 🔗 link line. If the list is empty, \
 omit this section entirely.
 - Section 3: "💬 Community" (Hacker News top stories)
-- Section 4: "🔬 Research" (academic papers + top RSS pick)
+- Section 4: "🔬 Research" (academic papers, then the top RSS pick from a \
+curated source list as the last item)
 - Community/Research items: 1 short sentence summary + a 🔗 link line
-- The top RSS pick from a curated source list goes at the top of the Research section as a 5th item
+- Never show the same story, paper or repo in more than one section
 - Footer: "Emerging themes:" — assign 1-3 topic tags to every item in the \
 digest, count tag frequency weighted by engagement, and list the top 2-4 \
 as "• theme (N items)". Themes should be specific ("agent benchmarks", \
@@ -126,7 +148,8 @@ as "• theme (N items)". Themes should be specific ("agent benchmarks", \
 - If there is no trending data, omit the Trending section entirely
 - Total length: aim for ~300 words — short, fast to scan
 - Voice: casual, peer-to-peer, not clickbait
-- No emoji in body text; only the section headers and the 🔥/📈 markers above
+- No emoji in body text other than the section headers, the 🔥 marker, \
+the 🔗 link prefix and ★ in star counts
 - Always include the 🔗 URL on its own line
 
 If the data has only 3 HN stories and 1 RSS item and 0 papers, that's a valid \
@@ -152,7 +175,7 @@ def _trim_trending(trending):
     for c in (trending.get("candidates") or [])[:8]:
         sig = c.get("signals") or {}
         hn, gh = sig.get("hn") or {}, sig.get("github") or {}
-        rd, bs = sig.get("reddit") or {}, sig.get("bsky") or {}
+        bs = sig.get("bsky") or {}
         keep.append({
             "title": c.get("title"),
             "kind": c.get("kind"),
@@ -164,8 +187,6 @@ def _trim_trending(trending):
             "hn": {"threads": hn.get("threads", 0), "points": hn.get("points", 0),
                    "comments": hn.get("comments", 0)},
             "github": {"repos": gh.get("repos", 0), "stars": gh.get("stars", 0)},
-            "reddit": None if rd.get("unavailable") else
-                      {"posts": rd.get("posts", 0), "score": rd.get("score", 0)},
             "bsky": None if bs.get("unavailable") else
                     {"posts": bs.get("posts", 0), "likes": bs.get("likes", 0)},
             "hf_upvotes": c.get("hf_upvotes", 0),
@@ -201,7 +222,8 @@ def call_llm(data, trending=None):
             "User-Agent": "Hermes/1.0 tech-digest",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
+    # Reasoning output of up to max_tokens can take minutes to generate.
+    with urllib.request.urlopen(req, timeout=300) as r:
         resp = json.loads(r.read())
     msg = resp["choices"][0]["message"]
     content = msg.get("content") or ""
@@ -217,33 +239,63 @@ def call_llm(data, trending=None):
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN:
-        print("WARN: TELEGRAM_BOT_TOKEN not loaded; printing digest to stdout instead.")
-        print("---")
-        print(message)
-        print("---")
-        return 0
+TELEGRAM_MAX_LEN = 4096
+
+
+def split_message(text, limit=TELEGRAM_MAX_LEN):
+    """Split on blank lines (section/item boundaries), then on single
+    newlines, and hard-cut only a single line that is itself too long."""
+    chunks, cur = [], ""
+    for para in text.split("\n\n"):
+        pieces = [para] if len(para) <= limit else para.split("\n")
+        for i, piece in enumerate(pieces):
+            sep = "\n\n" if i == 0 else "\n"
+            while len(piece) > limit:
+                if cur:
+                    chunks.append(cur)
+                    cur = ""
+                chunks.append(piece[:limit])
+                piece = piece[limit:]
+            if cur and len(cur) + len(sep) + len(piece) > limit:
+                chunks.append(cur)
+                cur = piece
+            else:
+                cur = cur + sep + piece if cur else piece
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _send_one(text):
     payload = json.dumps({
         "chat_id": TELEGRAM_TARGET,
-        "text": message,
+        "text": text,
         "disable_web_page_preview": True,
     })
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data=payload.encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = json.loads(r.read())
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram returned {body}")
+
+
+def send_telegram(message):
+    """Send the digest; returns 0 on success, 3 on failure."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN not loaded; digest NOT sent:", file=sys.stderr)
+        print(message, file=sys.stderr)
+        return 3
     try:
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data=payload.encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            body = json.loads(r.read())
-        if not body.get("ok"):
-            print(f"Send failed: {body}", file=sys.stderr)
-            return 1
+        for chunk in split_message(message):
+            _send_one(chunk)
         return 0
     except Exception as e:
         print(f"Send error: {e}", file=sys.stderr)
-        return 1
+        return 3
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +303,11 @@ def send_telegram(message):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Discover data file
-    data_path = _find_data_file()
+    # Today's data only — see module docstring.
+    data_path = _today_file("tech_digest_data")
     if not data_path:
-        print("No data file found. Run tech_digest.py first.", file=sys.stderr)
+        print("No tech_digest_data file for today. Did tech_digest.py fail?",
+              file=sys.stderr)
         sys.exit(1)
     with open(data_path) as f:
         data = json.load(f)
@@ -262,7 +315,7 @@ def main():
 
     # Load trending data (optional — digest works without it)
     trending = None
-    trending_path = _find_trending_file()
+    trending_path = _today_file("trending_data")
     if trending_path:
         try:
             with open(trending_path) as f:
@@ -270,6 +323,9 @@ def main():
             print(f"Using trending data from {trending_path}")
         except Exception as e:
             print(f"WARN: could not read {trending_path}: {e}")
+    else:
+        print("WARN: no trending data for today; omitting Trending section")
+    data = _drop_overlap(data, trending)
 
     # Call LLM
     try:

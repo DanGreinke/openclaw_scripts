@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # tech_digest_run.sh — daily runner for the tech digest cron job.
 #
-# Runs the fetcher first, then the summarizer. If the fetcher fails,
-# continue to summarizer anyway (the summarizer uses the data file,
-# which may still be useful from a previous run if the fetcher died
-# mid-flight).
+# Runs the fetcher and trending stages, then the summarizer. A non-zero
+# exit from either fetch stage usually means a partial result (some
+# sources failed but the file was still written), so we continue. The
+# summarizer only uses files dated today: if a stage wrote nothing, its
+# section is omitted (trending) or the run fails (fetcher) instead of
+# re-sending yesterday's data.
 set -e
 
 SCRIPTS=/data/.hermes/scripts

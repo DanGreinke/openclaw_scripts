@@ -6,11 +6,12 @@ Fetches curated RSS, Hacker News, and ArXiv items and writes the raw
 data to a JSON file. The summarization stage (tech_digest_summarize.py)
 reads this file, asks the LLM to write a tight brief, and sends to Telegram.
 
-For fresh news, the Hermes-side web_search tool is used during summarization
-or interactive use; we don't depend on a Brave News API key here.
+There's no general-news source any more (the Brave News API was dropped);
+trending.py covers what's getting attention.
 
 Outputs:
-  /data/.hermes/scripts/tech_digest_data_<YYYY-MM-DD>.json
+  $TECH_DIGEST_DIR/tech_digest_data_<YYYY-MM-DD>.json
+  (TECH_DIGEST_DIR defaults to /data/.hermes/scripts; <DATE> is Pacific time)
 
 Exit codes:
   0 = success (file written)
@@ -25,12 +26,11 @@ import sys
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
-# Hermes has built-in web_search; we don't need a Brave News API key here.
-BRAVE_KEY = ""
-OUTPUT_DIR      = Path("/data/.hermes/scripts")
+OUTPUT_DIR = Path(os.environ.get("TECH_DIGEST_DIR", "/data/.hermes/scripts"))
+UA = "Hermes/1.0 tech-digest"
 
 # --- RSS feeds (filtered by keyword) ---
 RSS_FEEDS = [
@@ -60,9 +60,12 @@ def truncate(text, n=140):
     return text[:n] + "…" if len(text) > n else text
 
 
+def _request(url):
+    return urllib.request.Request(url, headers={"User-Agent": UA})
+
+
 def fetch_rss_items(url, source_name):
-    req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0 tech-digest"})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(_request(url), timeout=10) as r:
         root = ET.fromstring(r.read())
     items = []
     channel = root.find("channel")
@@ -113,7 +116,7 @@ def fetch_top_rss_item():
     return None
 
 
-def fetch_hn(count=3):
+def fetch_hn(count=6):
     now_ts = int(datetime.now(timezone.utc).timestamp())
     cutoff_ts = now_ts - (48 * 3600)
 
@@ -121,7 +124,7 @@ def fetch_hn(count=3):
         "https://hn.algolia.com/api/v1/search"
         f"?query=&tags=story&hitsPerPage=100&numericFilters=created_at_i>{cutoff_ts}"
     )
-    with urllib.request.urlopen(req_orig(url), timeout=10) as r:
+    with urllib.request.urlopen(_request(url), timeout=10) as r:
         hits = json.loads(r.read()).get("hits", [])
 
     sorted_hits = sorted(hits, key=lambda x: x.get("num_comments", 0), reverse=True)
@@ -142,14 +145,6 @@ def fetch_hn(count=3):
     return results
 
 
-def req_orig(url, headers=None):
-    """Build a urllib.request.Request with default UA headers."""
-    h = {"User-Agent": "Hermes/1.0 tech-digest"}
-    if headers:
-        h.update(headers)
-    return urllib.request.Request(url, headers=h)
-
-
 def fetch_arxiv(count=3):
     query = urllib.parse.quote("cat:cs.AI OR cat:cs.LG OR cat:cs.RO")
     url = (
@@ -158,8 +153,7 @@ def fetch_arxiv(count=3):
         "&sortBy=submittedDate&sortOrder=descending"
         f"&max_results={count}"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0 tech-digest"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(_request(url), timeout=15) as r:
         root = ET.fromstring(r.read())
     ns = {"a": "http://www.w3.org/2005/Atom"}
     papers = []
@@ -182,24 +176,33 @@ def fetch_arxiv(count=3):
 # Main
 # ---------------------------------------------------------------------------
 
+def local_now(utc):
+    """Pacific time. Falls back to a computed US DST rule (second Sunday of
+    March to first Sunday of November) if the container has no tz database."""
+    try:
+        from zoneinfo import ZoneInfo
+        return utc.astimezone(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        y = utc.year
+        start = datetime(y, 3, 8 + (6 - date(y, 3, 8).weekday()) % 7, 10, tzinfo=timezone.utc)
+        end = datetime(y, 11, 1 + (6 - date(y, 11, 1).weekday()) % 7, 9, tzinfo=timezone.utc)
+        return utc.astimezone(timezone(timedelta(hours=-7 if start <= utc < end else -8)))
+
+
 def main():
     utc = datetime.now(timezone.utc)
-    dst = (utc.month > 3 or (utc.month == 3 and utc.day >= 8)) and utc.month < 11
-    now = utc.astimezone(timezone(timedelta(hours=-7 if dst else -8)))
+    now = local_now(utc)
     date_str = now.strftime("%B %-d, %Y")
     iso_date = now.strftime("%Y-%m-%d")
 
     data = {
         "date": date_str,
         "fetched_at_utc": utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "news": [],       # reserved; Hermes-side web_search handles fresh news
         "rss_top": None,
         "hn": [],         # list of {"title", "url", "hn_link", "points", "comments"}
         "arxiv": [],      # list of {"title", "summary", "url"}
         "errors": [],
     }
-
-    # (Brave News removed — Hermes itself uses web_search for fresh news.)
 
     # RSS top pick
     try:
@@ -209,9 +212,10 @@ def main():
     except Exception as e:
         data["errors"].append(f"RSS: {e}")
 
-    # Hacker News
+    # Hacker News — fetch extra so the summarizer can drop stories that
+    # already appear in the Trending section and still have 3 left.
     try:
-        data["hn"] = fetch_hn(3)
+        data["hn"] = fetch_hn(6)
     except Exception as e:
         data["errors"].append(f"HN: {e}")
 
@@ -228,7 +232,7 @@ def main():
         with open(out_path, "w") as f:
             json.dump(data, f, indent=2)
         print(f"✅ Wrote {out_path}")
-        print(f"   news={len(data['news'])} rss={data['rss_top'] is not None} hn={len(data['hn'])} arxiv={len(data['arxiv'])} errors={len(data['errors'])}")
+        print(f"   rss={data['rss_top'] is not None} hn={len(data['hn'])} arxiv={len(data['arxiv'])} errors={len(data['errors'])}")
     except Exception as e:
         print(f"FATAL: could not write {out_path}: {e}", file=sys.stderr)
         sys.exit(2)

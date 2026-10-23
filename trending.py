@@ -5,18 +5,24 @@ trending.py — trend-detection stage for the tech digest.
 Pipeline (per the trend-detection design):
   Stage 1 (harvest):  HF daily papers (top 10 by upvotes)
                       + HN top stories (top 6 by comments, last 48h)
+                      + keyword-matched editorial RSS items
   Stage 2 (signals):  per candidate — HN Algolia, GitHub repo search,
-                      Reddit*, Bluesky*
-                      (* Reddit/Bluesky fail soft: both IP-blocked from the
-                       Railway container as of 2026-10. Circuit breaker
-                       disables them after the first 403 so we don't burn
-                       time; they re-enable automatically if unblocked.)
+                      Bluesky*
+                      (* Bluesky fails soft: IP-blocked from the Railway
+                       container as of 2026-10. Circuit breaker disables it
+                       after the first 403 so we don't burn time; it
+                       re-enables automatically if unblocked. A blocked
+                       source is reported in sources_status, not as an error.)
   Stage 3 (score):    trend_score = Σ log1p(engagement) per source
   Stage 5 (persist):  trending_data_<DATE>.json + trailing-7-day history
-                      (days_seen → "N days straight", rising flag vs
-                       trailing average)
+                      (days_seen → consecutive days on the list, rising
+                       flag vs trailing average)
 
-Output: /data/.hermes/scripts/trending_data_<YYYY-MM-DD>.json
+<DATE> is the Pacific-time date, matching tech_digest.py, so the summarizer
+can tell whether both files are from today.
+
+Output: $TECH_DIGEST_DIR/trending_data_<YYYY-MM-DD>.json
+        (TECH_DIGEST_DIR defaults to /data/.hermes/scripts)
 Exit codes: 0 = success, 1 = partial (some sources failed), 2 = fatal
 """
 
@@ -30,17 +36,14 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
+from tech_digest import local_now
+
+UA = "Hermes/1.0 tech-digest"
 TIMEOUT = 12
-REDDIT_GAP = 1.2
-GITHUB_GAP = 2.1  # authenticated search limit is 30 req/min — stay under it
-OUT_DIR = Path("/data/.hermes/scripts")
+OUT_DIR = Path(os.environ.get("TECH_DIGEST_DIR", "/data/.hermes/scripts"))
 HISTORY_DAYS = 7
 
 HF_PAPER_COUNT = 10
@@ -80,14 +83,23 @@ STOPWORDS = {
     "these", "those", "it", "its", "can", "do", "does", "how", "why", "what",
     "toward", "towards", "using", "use", "based", "new", "into", "without",
     "more", "most", "less", "than", "not", "no", "all", "any",
+    # HN title prefixes ("Show HN: ...") carry no topic signal
+    "show", "ask", "hn", "launch",
 }
 
 _errors = []
-_last_reddit = [0.0]
 _last_github = [0.0]
 # Circuit breakers: once a source hard-fails (403), skip it for the rest
 # of the run so we don't pay the rate-limit sleep 16 times for nothing.
-_source_down = {"reddit": False, "bsky": False}
+_source_down = {"hn": False, "github": False, "bsky": False}
+# Sources whose 403 is expected (IP-blocked host) and shouldn't count as an
+# error. A GitHub/HN 403 is a rate limit or auth problem worth surfacing.
+SOFT_SOURCES = {"bsky"}
+
+
+def local_today():
+    """Today's date in Pacific time, as YYYY-MM-DD (same as tech_digest.py)."""
+    return local_now(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
@@ -108,14 +120,12 @@ def _load_secret(env_path, key):
 
 ENV_PATH = os.environ.get("HERMES_ENV_FILE", "/data/.hermes/.env")
 GITHUB_TOKEN = _load_secret(ENV_PATH, "GITHUB_API_KEY")
+# Search API limit: 30 req/min authenticated, 10 req/min without a token.
+GITHUB_GAP = 2.1 if GITHUB_TOKEN else 6.1
 
 
 def fetch_json(url, extra_headers=None):
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = {"User-Agent": UA, "Accept": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
@@ -129,11 +139,13 @@ def sig_words(title, n=6):
     return out[:n]
 
 
-def _reddit_wait():
-    delta = time.time() - _last_reddit[0]
-    if delta < REDDIT_GAP:
-        time.sleep(REDDIT_GAP - delta)
-    _last_reddit[0] = time.time()
+_ARXIV_ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})", re.I)
+
+
+def arxiv_id_from_url(url):
+    """'https://arxiv.org/pdf/2410.12345v2' → '2410.12345' (else '')."""
+    m = _ARXIV_ID_RE.search(url or "")
+    return m.group(1) if m else ""
 
 
 def _github_wait():
@@ -176,6 +188,7 @@ def harvest_hf_papers(count=HF_PAPER_COUNT):
             "title": title,
             "id": arxiv_id,
             "url": f"https://arxiv.org/abs/{arxiv_id}",
+            "arxiv_id": arxiv_id,
             "hn_link": "",
             "hf_upvotes": up,
         })
@@ -196,12 +209,14 @@ def harvest_hn_stories(count=HN_STORY_COUNT):
     items = []
     for h in hits[:count]:
         oid = h.get("objectID", "")
+        url = h.get("url") or f"https://news.ycombinator.com/item?id={oid}"
         items.append({
             "key": f"hn:{oid}",
             "kind": "story",
             "title": h.get("title", ""),
             "id": oid,
-            "url": h.get("url") or f"https://news.ycombinator.com/item?id={oid}",
+            "url": url,
+            "arxiv_id": arxiv_id_from_url(url),
             "hn_link": f"https://news.ycombinator.com/item?id={oid}",
             "hf_upvotes": 0,
             # Front-page harvest already gives us the HN signal for free.
@@ -270,6 +285,7 @@ def harvest_rss_articles():
                 "title": title,
                 "id": "",
                 "url": link,
+                "arxiv_id": arxiv_id_from_url(link),
                 "hn_link": "",
                 "hf_upvotes": 0,
                 "feed": source,
@@ -279,7 +295,11 @@ def harvest_rss_articles():
 
 
 def _canon_url(url):
-    """Normalize a URL for cross-source dedupe."""
+    """Normalize a URL for cross-source dedupe. arXiv abs/pdf/html links
+    (with or without a version suffix) all collapse to the paper id."""
+    aid = arxiv_id_from_url(url)
+    if aid:
+        return f"arxiv:{aid}"
     u = (url or "").strip().lower()
     u = re.sub(r"^https?://(www\.)?", "", u)
     u = u.split("#", 1)[0].split("?", 1)[0].rstrip("/")
@@ -303,14 +323,11 @@ def dedupe_candidates(candidates):
         keep, drop = by_url[u], c
         if PRIORITY.get(drop["kind"], 9) < PRIORITY.get(keep["kind"], 9):
             keep, drop = drop, keep
-        # merge: survivor inherits the loser's identifying fields
-        if drop.get("hf_upvotes") and not keep.get("hf_upvotes"):
-            keep["hf_upvotes"] = drop["hf_upvotes"]
-        if drop.get("id") and not keep.get("id"):
-            keep["id"] = drop["id"]
-        if drop["kind"] == "paper" and drop.get("id"):
-            keep["id"] = keep.get("id") or drop["id"]
-        keep.setdefault("merged_keys", []).append(drop["key"])
+        # merge: survivor inherits the loser's signals and identity
+        keep["hf_upvotes"] = max(keep.get("hf_upvotes", 0), drop.get("hf_upvotes", 0))
+        keep["arxiv_id"] = keep.get("arxiv_id") or drop.get("arxiv_id", "")
+        keep["merged_keys"] = (keep.get("merged_keys", []) + [drop["key"]]
+                               + drop.get("merged_keys", []))
         by_url[u] = keep
     return list(by_url.values())
 
@@ -337,11 +354,26 @@ def hn_stats(words):
             "query": " ".join(words)}
 
 
-def github_stats(query):
-    """GitHub repo search — 'is anyone implementing this?' signal."""
+GITHUB_FALLBACK_AGE_D = 90
+GITHUB_FALLBACK_STAR_CAP = 1000
+
+
+def github_stats(query, fallback=False):
+    """GitHub repo search — 'is anyone implementing this?' signal.
+
+    Exact mode (arxiv id): search READMEs, where implementations cite the
+    paper. Fallback mode (title words): only count repos created recently
+    and cap each repo's stars, so a generic title can't match an unrelated
+    100k-star project and dominate the score."""
     _github_wait()
-    q = urllib.parse.quote(query)
-    url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=5"
+    if fallback:
+        since = (datetime.now(timezone.utc)
+                 - timedelta(days=GITHUB_FALLBACK_AGE_D)).strftime("%Y-%m-%d")
+        q = f"{query} created:>{since}"
+    else:
+        q = f'"{query}" in:readme'
+    url = (f"https://api.github.com/search/repositories?q={urllib.parse.quote(q)}"
+           "&sort=stars&order=desc&per_page=5")
     headers = {"Accept": "application/vnd.github+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
@@ -350,34 +382,11 @@ def github_stats(query):
     stars = 0
     for r in repos:
         try:
-            stars += int(r.get("stargazers_count") or 0)
+            n = int(r.get("stargazers_count") or 0)
         except (TypeError, ValueError):
-            pass
-    return {"repos": len(repos), "stars": stars, "query": query}
-
-
-def reddit_stats(query):
-    _reddit_wait()
-    url = (
-        "https://www.reddit.com/search.json?q="
-        + urllib.parse.quote(query)
-        + "&sort=new&limit=25&t=week"
-    )
-    data = fetch_json(url)
-    children = (data.get("data") or {}).get("children") or []
-    score = comments = 0
-    for c in children:
-        d = c.get("data") or {}
-        try:
-            score += int(d.get("score") or 0)
-        except (TypeError, ValueError):
-            pass
-        try:
-            comments += int(d.get("num_comments") or 0)
-        except (TypeError, ValueError):
-            pass
-    return {"posts": len(children), "score": score, "comments": comments,
-            "query": query}
+            continue
+        stars += min(n, GITHUB_FALLBACK_STAR_CAP) if fallback else n
+    return {"repos": len(repos), "stars": stars, "query": q}
 
 
 def bsky_stats(query):
@@ -400,6 +409,7 @@ def bsky_stats(query):
 def fetch_trending_repos(count=5):
     """New repos gaining stars fast — 'trending on GitHub' proxy, independent
     of any paper/story. created:>7d + min-stars filters out stale projects."""
+    _github_wait()
     since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
     q = urllib.parse.quote(f"created:>{since} stars:>100")
     url = (f"https://api.github.com/search/repositories?q={q}"
@@ -420,19 +430,24 @@ def fetch_trending_repos(count=5):
     return repos
 
 
-def _try_source(name, fn, *args):
-    """Call a signal source; circuit-break on repeated hard failure."""
+def _try_source(name, fn, *args, **kwargs):
+    """Call a signal source; circuit-break on hard failure (403).
+
+    A blocked SOFT_SOURCES source is reported via sources_status rather
+    than _errors, so a source that's been blocked for weeks doesn't make
+    every run 'partial'."""
     if _source_down.get(name):
         return None
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except Exception as exc:
-        _errors.append(f"{name}:{args[0] if args else ''}: "
-                       f"{type(exc).__name__}: {exc}")
-        # 403 / blocked → disable for the rest of the run
-        if "403" in str(exc) or "Blocked" in str(exc):
+        blocked = getattr(exc, "code", None) == 403 or "Blocked" in str(exc)
+        if blocked:
             _source_down[name] = True
-            _errors.append(f"{name}: hard-blocked, disabled for this run")
+            print(f"{name}: blocked (403), disabled for this run")
+        if not (blocked and name in SOFT_SOURCES):
+            _errors.append(f"{name}:{args[0] if args else ''}: "
+                           f"{type(exc).__name__}: {exc}")
         return None
 
 
@@ -453,50 +468,37 @@ def score_candidate(c):
     else:
         hn = {"threads": 0, "points": 0, "comments": 0, "query": ""}
 
-    # GitHub: arxiv id first for papers, title words fallback
+    # GitHub / Bluesky: arxiv id first (exact), title words as fallback.
+    # Keyed on arxiv_id, not kind, so an HN story that links a paper
+    # still gets the exact lookup.
+    aid = c.get("arxiv_id")
+    query = " ".join(words)
+
     gh = None
-    if c["kind"] == "paper" and c.get("id"):
-        gh = _try_source("github", github_stats, c["id"])
-        if gh and gh["repos"] == 0 and words:
-            gh = _try_source("github", github_stats, " ".join(words))
-    elif words:
-        gh = _try_source("github", github_stats, " ".join(words))
+    if aid:
+        gh = _try_source("github", github_stats, aid)
+    if (gh is None or gh["repos"] == 0) and words:
+        gh = _try_source("github", github_stats, query, fallback=True) or gh
     if gh is None:
         gh = {"repos": 0, "stars": 0, "query": ""}
 
-    # Reddit: arxiv id, title fallback (usually blocked from this host)
-    reddit = None
-    if c["kind"] == "paper" and c.get("id"):
-        reddit = _try_source("reddit", reddit_stats, c["id"])
-        if reddit and reddit["posts"] == 0 and words:
-            reddit = _try_source("reddit", reddit_stats, " ".join(words)) or reddit
-    elif words:
-        reddit = _try_source("reddit", reddit_stats, " ".join(words))
-    if reddit is None:
-        reddit = {"posts": 0, "score": 0, "comments": 0,
-                  "query": "", "unavailable": True}
-
-    # Bluesky (usually blocked from this host)
     bsky = None
-    if c["kind"] == "paper" and c.get("id"):
-        bsky = _try_source("bsky", bsky_stats, c["id"])
-        if bsky and bsky["posts"] == 0 and words:
-            bsky = _try_source("bsky", bsky_stats, " ".join(words)) or bsky
-    elif words:
-        bsky = _try_source("bsky", bsky_stats, " ".join(words))
+    if aid:
+        bsky = _try_source("bsky", bsky_stats, aid)
+    if (bsky is None or bsky["posts"] == 0) and words:
+        bsky = _try_source("bsky", bsky_stats, query) or bsky
     if bsky is None:
         bsky = {"posts": 0, "likes": 0, "query": "", "unavailable": True}
 
     score = (
         math.log1p(hn["points"] + 2 * hn["comments"])
         + math.log1p(gh["stars"] + 10 * gh["repos"])
-        + math.log1p(reddit["score"] + 2 * reddit["comments"])
         + math.log1p(5 * bsky["posts"] + bsky["likes"])
         + math.log1p(2 * c.get("hf_upvotes", 0))
     )
 
     c.pop("_hn_preset", None)
-    c["signals"] = {"hn": hn, "github": gh, "reddit": reddit, "bsky": bsky}
+    c["signals"] = {"hn": hn, "github": gh, "bsky": bsky}
     c["score"] = round(score, 2)
     return c
 
@@ -506,34 +508,40 @@ def score_candidate(c):
 # ---------------------------------------------------------------------------
 
 def load_history(today):
-    """Return {key: [scores from the trailing HISTORY_DAYS days]}."""
+    """Return {key: {date: score}} for the HISTORY_DAYS calendar days
+    before today. Merged duplicates are indexed under every key they had,
+    so an item keeps its history when a different source wins the dedupe."""
+    oldest = (date.fromisoformat(today) - timedelta(days=HISTORY_DAYS)).isoformat()
     history = {}
-    seen_dates = set()
-    for path in sorted(OUT_DIR.glob("trending_data_*.json"), reverse=True):
+    for path in OUT_DIR.glob("trending_data_*.json"):
         date_part = path.stem.replace("trending_data_", "")
-        if date_part >= today:
+        if not (oldest <= date_part < today):
             continue
-        if len(seen_dates) >= HISTORY_DAYS:
-            break
         try:
             with open(path) as f:
                 data = json.load(f)
         except Exception:
             continue
-        seen_dates.add(date_part)
         for c in data.get("candidates", []):
-            history.setdefault(c.get("key", ""), []).append(
-                (date_part, c.get("score", 0.0)))
+            for key in [c.get("key", "")] + c.get("merged_keys", []):
+                history.setdefault(key, {})[date_part] = c.get("score", 0.0)
     return history
 
 
-def annotate_history(candidates, history):
+def annotate_history(candidates, history, today):
     for c in candidates:
-        past = history.get(c["key"], [])
-        c["days_seen"] = len(past) + 1  # today counts
-        c["prev_scores"] = [round(s, 2) for _, s in past[:HISTORY_DAYS]]
+        past = {}
+        for key in [c["key"]] + c.get("merged_keys", []):
+            past.update(history.get(key, {}))
+        # Consecutive days on the list, counting back from yesterday.
+        streak, d = 1, date.fromisoformat(today)  # today counts
+        while (d - timedelta(days=1)).isoformat() in past:
+            d -= timedelta(days=1)
+            streak += 1
+        c["days_seen"] = streak
+        c["prev_scores"] = [round(past[k], 2) for k in sorted(past, reverse=True)]
         if past:
-            avg = sum(s for _, s in past) / len(past)
+            avg = sum(past.values()) / len(past)
             c["rising"] = c["score"] > max(avg * 1.5, avg + 1.0)
         else:
             c["rising"] = False  # no baseline yet — new ≠ rising
@@ -545,7 +553,7 @@ def annotate_history(candidates, history):
 # ---------------------------------------------------------------------------
 
 def main():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = local_today()
     print(f"=== trending.py {today} ===")
 
     # Stage 1
@@ -588,13 +596,13 @@ def main():
 
     # Stage 5
     history = load_history(today)
-    results = annotate_history(results, history)
+    results = annotate_history(results, history, today)
 
     print()
     print(f"{'#':>2} {'score':>5}  title")
     for rank, r in enumerate(results, 1):
         hn, gh = r["signals"]["hn"], r["signals"]["github"]
-        rd, bs = r["signals"]["reddit"], r["signals"]["bsky"]
+        bs = r["signals"]["bsky"]
         flags = []
         if r["days_seen"] > 1:
             flags.append(f"{r['days_seen']}d")
@@ -604,7 +612,6 @@ def main():
         print(f"{rank:>2} {r['score']:>5.1f}  {r['title'][:65]}{flag_s}")
         print(f"      HN {hn['threads']}th/{hn['points']}pt/{hn['comments']}c"
               f" | GH {gh['repos']}repo/{gh['stars']}★"
-              f" | R {'n/a' if rd.get('unavailable') else str(rd['posts']) + 'p'}"
               f" | BS {'n/a' if bs.get('unavailable') else str(bs['posts']) + 'p'}"
               f" | HF {r.get('hf_upvotes', 0)}")
 
